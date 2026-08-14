@@ -1,0 +1,592 @@
+#!/usr/bin/env python3
+# UniGlow — keyboard backlight control for Uniwill laptops (tuxedo-drivers).
+# Talks to /sys/class/leds/{rgb,white}:kbd_backlight; brightness falls back to
+# systemd-logind SetBrightness when sysfs is not writable.
+# MIT License. https://github.com/CloudWells/uniglow
+
+import colorsys
+import json
+import locale
+import math
+import os
+import signal
+import subprocess
+import sys
+
+APP_ID = "io.github.cloudwells.uniglow"
+VERSION = "1.0.0"
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "uniglow")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+AUTOSTART_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "autostart")
+AUTOSTART_PATH = os.path.join(AUTOSTART_DIR, "uniglow-apply.desktop")
+
+LED_CANDIDATES = ("rgb:kbd_backlight", "white:kbd_backlight")
+
+PRESETS = [
+    "#FFFFFF", "#FF3B30", "#FF9500", "#FFCC00",
+    "#34C759", "#00C7BE", "#30B0FF", "#5856D6",
+    "#AF52DE", "#FF2D55",
+]
+
+DEFAULT_CONFIG = {
+    "lang": "auto",          # auto | en | ru
+    "on": True,
+    "brightness": 4,         # 1..max (level used when "on")
+    "color": "#FFFFFF",
+    "mode": "static",        # static | breathing | rainbow
+    "speed": 5,              # 1..10
+}
+
+STRINGS = {
+    "en": {
+        "app": "UniGlow",
+        "subtitle": "Keyboard backlight",
+        "power": "Backlight",
+        "power_sub": "Turn the keyboard backlight on or off",
+        "brightness": "Brightness",
+        "color": "Color",
+        "custom_color": "Custom color",
+        "mode": "Mode",
+        "static": "Static",
+        "breathing": "Breathing",
+        "rainbow": "Rainbow",
+        "speed": "Effect speed",
+        "menu": "Menu",
+        "language": "Language",
+        "lang_auto": "System",
+        "autostart": "Restore on login",
+        "about": "About UniGlow",
+        "no_device": "No keyboard backlight device found.\n"
+                     "Install tuxedo-drivers (uniwill_wmi + tuxedo_keyboard) first.",
+        "no_perm": "No write access to {path}.\n"
+                   "Install the bundled udev rule or run once:\n"
+                   "sudo chmod g+w {path}",
+        "comment": "Keyboard backlight control",
+    },
+    "ru": {
+        "app": "UniGlow",
+        "subtitle": "Подсветка клавиатуры",
+        "power": "Подсветка",
+        "power_sub": "Включить или выключить подсветку клавиатуры",
+        "brightness": "Яркость",
+        "color": "Цвет",
+        "custom_color": "Свой цвет",
+        "mode": "Режим",
+        "static": "Статичный",
+        "breathing": "Дыхание",
+        "rainbow": "Радуга",
+        "speed": "Скорость эффекта",
+        "menu": "Меню",
+        "language": "Язык",
+        "lang_auto": "Системный",
+        "autostart": "Восстанавливать при входе",
+        "about": "О приложении",
+        "no_device": "Устройство подсветки клавиатуры не найдено.\n"
+                     "Сначала установите tuxedo-drivers (uniwill_wmi + tuxedo_keyboard).",
+        "no_perm": "Нет прав на запись в {path}.\n"
+                   "Установите udev-правило из комплекта или выполните разово:\n"
+                   "sudo chmod g+w {path}",
+        "comment": "Управление подсветкой клавиатуры",
+    },
+}
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH) as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def pick_lang(cfg):
+    if cfg.get("lang") in ("en", "ru"):
+        return cfg["lang"]
+    loc = (locale.getlocale()[0] or os.environ.get("LANG", "") or "")
+    return "ru" if loc.lower().startswith("ru") else "en"
+
+
+def hex_to_rgb(s):
+    s = s.lstrip("#")
+    return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def rgb_to_hex(r, g, b):
+    return "#%02X%02X%02X" % (r, g, b)
+
+
+class Backlight:
+    """sysfs LED device with logind fallback for brightness."""
+
+    def __init__(self):
+        self.path = None
+        self.name = None
+        self.is_rgb = False
+        for name in LED_CANDIDATES:
+            p = os.path.join("/sys/class/leds", name)
+            if os.path.isdir(p):
+                self.path = p
+                self.name = name
+                self.is_rgb = name.startswith("rgb:")
+                break
+        self.max_brightness = 1
+        if self.path:
+            with open(os.path.join(self.path, "max_brightness")) as f:
+                self.max_brightness = int(f.read().strip())
+
+    @property
+    def found(self):
+        return self.path is not None
+
+    def _write(self, attr, value):
+        with open(os.path.join(self.path, attr), "w") as f:
+            f.write(value)
+
+    def get_brightness(self):
+        with open(os.path.join(self.path, "brightness")) as f:
+            return int(f.read().strip())
+
+    def set_brightness(self, value):
+        value = max(0, min(self.max_brightness, int(value)))
+        try:
+            self._write("brightness", str(value))
+        except PermissionError:
+            # logind grants the active session brightness control without root
+            subprocess.run(
+                ["busctl", "call", "org.freedesktop.login1",
+                 "/org/freedesktop/login1/session/auto",
+                 "org.freedesktop.login1.Session", "SetBrightness",
+                 "ssu", "leds", self.name, str(value)],
+                check=False, capture_output=True)
+
+    def get_color(self):
+        if not self.is_rgb:
+            return (255, 255, 255)
+        with open(os.path.join(self.path, "multi_intensity")) as f:
+            return tuple(int(x) for x in f.read().split())
+
+    def set_color(self, r, g, b):
+        # raises PermissionError for the caller to surface a hint
+        if self.is_rgb:
+            self._write("multi_intensity", "%d %d %d" % (r, g, b))
+
+    def color_path(self):
+        return os.path.join(self.path, "multi_intensity")
+
+
+class Engine:
+    """Applies config to the device, runs software effects on a GLib timer."""
+
+    def __init__(self, backlight, glib):
+        self.bl = backlight
+        self.glib = glib
+        self._timer = None
+        self._phase = 0.0
+
+    def stop(self):
+        if self._timer is not None:
+            self.glib.source_remove(self._timer)
+            self._timer = None
+
+    def apply(self, cfg):
+        self.stop()
+        if not self.bl.found:
+            return
+        if not cfg["on"]:
+            self.bl.set_brightness(0)
+            return
+        self.bl.set_brightness(cfg["brightness"])
+        mode = cfg["mode"] if self.bl.is_rgb else "static"
+        if mode == "static":
+            self.bl.set_color(*hex_to_rgb(cfg["color"]))
+        else:
+            interval = 66  # ~15 Hz; EC WMI writes are a few ms each
+            step = cfg["speed"] / 10.0
+            base = hex_to_rgb(cfg["color"])
+
+            def tick():
+                self._phase += step * 0.12
+                if mode == "breathing":
+                    k = (1 - math.cos(self._phase * 2 * math.pi)) / 2
+                    k = 0.06 + 0.94 * k
+                    rgb = tuple(int(c * k) for c in base)
+                else:  # rainbow
+                    rgb = tuple(int(c * 255) for c in colorsys.hsv_to_rgb(
+                        self._phase % 1.0, 1.0, 1.0))
+                try:
+                    self.bl.set_color(*rgb)
+                except OSError:
+                    return False
+                return True
+
+            self._timer = self.glib.timeout_add(interval, tick)
+
+
+def autostart_enabled():
+    return os.path.exists(AUTOSTART_PATH)
+
+
+def set_autostart(enabled):
+    if enabled:
+        os.makedirs(AUTOSTART_DIR, exist_ok=True)
+        with open(AUTOSTART_PATH, "w") as f:
+            f.write("[Desktop Entry]\n"
+                    "Type=Application\n"
+                    "Name=UniGlow (restore backlight)\n"
+                    "Exec=uniglow --apply\n"
+                    "X-GNOME-Autostart-enabled=true\n")
+    else:
+        try:
+            os.remove(AUTOSTART_PATH)
+        except OSError:
+            pass
+
+
+def run_apply():
+    """Headless: apply saved state; stay resident only for animated modes."""
+    from gi.repository import GLib
+    cfg = load_config()
+    bl = Backlight()
+    if not bl.found:
+        sys.exit(1)
+    eng = Engine(bl, GLib)
+    eng.apply(cfg)
+    if cfg["on"] and cfg["mode"] in ("breathing", "rainbow") and bl.is_rgb:
+        loop = GLib.MainLoop()
+        for s in (signal.SIGINT, signal.SIGTERM):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, s, loop.quit)
+        loop.run()
+
+
+def kill_stray_apply():
+    # a resident `--apply` effect process would fight the GUI over the EC
+    me = os.getpid()
+    out = subprocess.run(["pgrep", "-f", "uniglow --apply"],
+                         capture_output=True, text=True).stdout.split()
+    for pid in out:
+        if pid.isdigit() and int(pid) != me:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except OSError:
+                pass
+
+
+class Window:
+    def __init__(self, app, cfg, bl, engine):
+        import gi
+        gi.require_version("Gtk", "4.0")
+        gi.require_version("Adw", "1")
+        from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+        self.Adw, self.Gtk, self.Gdk = Adw, Gtk, Gdk
+        self.Gio, self.GLib = Gio, GLib
+        self.app = app
+        self.cfg = cfg
+        self.bl = bl
+        self.engine = engine
+        self.t = STRINGS[pick_lang(cfg)]
+        self._building = True
+
+        self.win = Adw.ApplicationWindow(application=app)
+        self.win.set_default_size(420, 560)
+        self.win.set_title(self.t["app"])
+        self.win.connect("close-request", self._on_close)
+
+        self.toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        self.menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic")
+        header.pack_end(self.menu_btn)
+        self.toolbar.add_top_bar(header)
+        self.win.set_content(self.toolbar)
+
+        self.toast = Adw.ToastOverlay()
+        self.toolbar.set_content(self.toast)
+
+        clamp = Adw.Clamp(maximum_size=440, margin_top=18, margin_bottom=18,
+                          margin_start=14, margin_end=14)
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        clamp.set_child(self.box)
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.set_child(clamp)
+        self.toast.set_child(scroll)
+
+        self._build_menu()
+        if not bl.found:
+            self._build_missing()
+        else:
+            self._build_controls()
+        self._building = False
+
+    # ---------- UI construction ----------
+
+    def _build_missing(self):
+        page = self.Adw.StatusPage(
+            icon_name="input-keyboard-symbolic",
+            title=self.t["app"], description=self.t["no_device"])
+        self.box.append(page)
+
+    def _build_controls(self):
+        Adw, Gtk = self.Adw, self.Gtk
+        t, cfg = self.t, self.cfg
+
+        # power + brightness
+        g1 = Adw.PreferencesGroup(title=t["subtitle"])
+        self.sw_power = Adw.SwitchRow(title=t["power"], subtitle=t["power_sub"])
+        self.sw_power.set_active(cfg["on"])
+        self.sw_power.connect("notify::active", self._changed)
+        g1.add(self.sw_power)
+
+        row_b = Adw.ActionRow(title=t["brightness"])
+        self.sc_bright = Gtk.Scale.new_with_range(
+            Gtk.Orientation.HORIZONTAL, 1, self.bl.max_brightness, 1)
+        self.sc_bright.set_size_request(190, -1)
+        self.sc_bright.set_valign(Gtk.Align.CENTER)
+        self.sc_bright.set_hexpand(True)
+        self.sc_bright.set_draw_value(False)
+        for i in range(1, self.bl.max_brightness + 1):
+            self.sc_bright.add_mark(i, Gtk.PositionType.BOTTOM, None)
+        self.sc_bright.set_value(max(1, cfg["brightness"]))
+        self.sc_bright.connect("value-changed", self._changed)
+        row_b.add_suffix(self.sc_bright)
+        g1.add(row_b)
+        self.box.append(g1)
+        self.grp_power = g1
+
+        # color
+        if self.bl.is_rgb:
+            g2 = Adw.PreferencesGroup(title=t["color"])
+            flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE,
+                               max_children_per_line=5, min_children_per_line=5,
+                               row_spacing=8, column_spacing=8,
+                               margin_top=6, margin_bottom=2)
+            css = "".join(
+                ".uniglow-sw-%d { background: %s; border-radius: 9999px;"
+                "  min-width: 34px; min-height: 34px; border: 1px solid alpha(currentColor, .25); }\n"
+                % (i, c) for i, c in enumerate(PRESETS))
+            prov = Gtk.CssProvider()
+            prov.load_from_string(css)
+            Gtk.StyleContext.add_provider_for_display(
+                self.Gdk.Display.get_default(), prov,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            for i, c in enumerate(PRESETS):
+                b = Gtk.Button()
+                b.add_css_class("uniglow-sw-%d" % i)
+                b.add_css_class("circular")
+                b.connect("clicked", self._preset_clicked, c)
+                flow.append(b)
+            g2.add(flow)
+
+            row_c = Adw.ActionRow(title=t["custom_color"])
+            self.color_btn = Gtk.ColorDialogButton(dialog=Gtk.ColorDialog(with_alpha=False))
+            rgba = self.Gdk.RGBA()
+            rgba.parse(cfg["color"])
+            self.color_btn.set_rgba(rgba)
+            self.color_btn.set_valign(Gtk.Align.CENTER)
+            self.color_btn.connect("notify::rgba", self._custom_color)
+            row_c.add_suffix(self.color_btn)
+            g2.add(row_c)
+            self.box.append(g2)
+            self.grp_color = g2
+
+            # mode + speed
+            g3 = Adw.PreferencesGroup(title=t["mode"])
+            self.toggles = Adw.ToggleGroup()
+            for name in ("static", "breathing", "rainbow"):
+                tg = Adw.Toggle(name=name, label=t[name])
+                self.toggles.add(tg)
+            self.toggles.set_active_name(cfg["mode"])
+            self.toggles.connect("notify::active-name", self._changed)
+            row_m = Adw.ActionRow()
+            row_m.set_child(self.toggles)
+            g3.add(row_m)
+
+            self.row_speed = Adw.ActionRow(title=t["speed"])
+            self.sc_speed = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1, 10, 1)
+            self.sc_speed.set_size_request(190, -1)
+            self.sc_speed.set_hexpand(True)
+            self.sc_speed.set_valign(Gtk.Align.CENTER)
+            self.sc_speed.set_draw_value(False)
+            self.sc_speed.set_value(cfg["speed"])
+            self.sc_speed.connect("value-changed", self._changed)
+            self.row_speed.add_suffix(self.sc_speed)
+            g3.add(self.row_speed)
+            self.box.append(g3)
+            self.grp_mode = g3
+
+        self._sync_sensitivity()
+
+    def _build_menu(self):
+        Gio = self.Gio
+        menu = Gio.Menu()
+
+        lang_menu = Gio.Menu()
+        for code, label in (("auto", self.t["lang_auto"]), ("en", "English"), ("ru", "Русский")):
+            item = Gio.MenuItem.new(label, "app.lang")
+            item.set_action_and_target_value("app.lang", self.GLib.Variant.new_string(code))
+            lang_menu.append_item(item)
+        menu.append_submenu(self.t["language"], lang_menu)
+        menu.append(self.t["autostart"], "app.autostart")
+        menu.append(self.t["about"], "app.about")
+        self.menu_btn.set_menu_model(menu)
+
+        a_lang = Gio.SimpleAction.new_stateful(
+            "lang", self.GLib.VariantType.new("s"),
+            self.GLib.Variant.new_string(self.cfg.get("lang", "auto")))
+        a_lang.connect("activate", self._set_lang)
+        self.app.add_action(a_lang)
+
+        a_auto = Gio.SimpleAction.new_stateful(
+            "autostart", None, self.GLib.Variant.new_boolean(autostart_enabled()))
+        a_auto.connect("activate", self._toggle_autostart)
+        self.app.add_action(a_auto)
+
+        a_about = self.Gio.SimpleAction.new("about", None)
+        a_about.connect("activate", self._about)
+        self.app.add_action(a_about)
+
+    # ---------- handlers ----------
+
+    def _collect(self):
+        cfg = self.cfg
+        cfg["on"] = self.sw_power.get_active()
+        cfg["brightness"] = int(self.sc_bright.get_value())
+        if self.bl.is_rgb:
+            cfg["mode"] = self.toggles.get_active_name() or "static"
+            cfg["speed"] = int(self.sc_speed.get_value())
+        return cfg
+
+    def _changed(self, *args):
+        if self._building:
+            return
+        cfg = self._collect()
+        save_config(cfg)
+        self._apply(cfg)
+        self._sync_sensitivity()
+
+    def _apply(self, cfg):
+        try:
+            self.engine.apply(cfg)
+        except PermissionError:
+            self._perm_hint()
+
+    def _preset_clicked(self, _btn, color):
+        rgba = self.Gdk.RGBA()
+        rgba.parse(color)
+        self.color_btn.set_rgba(rgba)  # triggers _custom_color
+
+    def _custom_color(self, *args):
+        if self._building:
+            return
+        rgba = self.color_btn.get_rgba()
+        self.cfg["color"] = rgb_to_hex(
+            int(rgba.red * 255), int(rgba.green * 255), int(rgba.blue * 255))
+        self._changed()
+
+    def _sync_sensitivity(self):
+        on = self.sw_power.get_active() if self.bl.found else False
+        self.sc_bright.set_sensitive(on)
+        if self.bl.is_rgb:
+            self.grp_color.set_sensitive(on)
+            self.grp_mode.set_sensitive(on)
+            self.row_speed.set_sensitive(
+                (self.toggles.get_active_name() or "static") != "static")
+
+    def _perm_hint(self):
+        msg = self.t["no_perm"].format(path=self.bl.color_path())
+        toast = self.Adw.Toast(title=msg.split("\n")[0], timeout=6)
+        self.toast.add_toast(toast)
+        print(msg, file=sys.stderr)
+
+    def _set_lang(self, action, value):
+        action.set_state(value)
+        self.cfg["lang"] = value.get_string()
+        save_config(self.cfg)
+        self.t = STRINGS[pick_lang(self.cfg)]
+        # rebuild UI in the new language
+        while child := self.box.get_first_child():
+            self.box.remove(child)
+        self._building = True
+        self._build_menu()
+        if self.bl.found:
+            self._build_controls()
+        else:
+            self._build_missing()
+        self._building = False
+        self.win.set_title(self.t["app"])
+
+    def _toggle_autostart(self, action, _p):
+        new = not action.get_state().get_boolean()
+        set_autostart(new)
+        action.set_state(self.GLib.Variant.new_boolean(new))
+
+    def _about(self, *args):
+        about = self.Adw.AboutDialog(
+            application_name="UniGlow",
+            application_icon=APP_ID,
+            version=VERSION,
+            developer_name="CloudWells",
+            license_type=self.Gtk.License.MIT_X11,
+            website="https://github.com/CloudWells/uniglow",
+            comments=self.t["comment"])
+        about.present(self.win)
+
+    def _on_close(self, *args):
+        # keep an animated mode running after the window closes
+        cfg = self.cfg
+        if self.bl.found and cfg["on"] and cfg["mode"] in ("breathing", "rainbow") \
+                and self.bl.is_rgb:
+            subprocess.Popen([sys.argv[0], "--apply"], start_new_session=True)
+        return False
+
+
+def run_gui():
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Adw", "1")
+    from gi.repository import Adw, GLib
+    kill_stray_apply()
+    cfg = load_config()
+    bl = Backlight()
+    engine = Engine(bl, GLib)
+
+    app = Adw.Application(application_id=APP_ID)
+
+    def on_activate(a):
+        for w in a.get_windows():
+            w.present()
+            return
+        win = Window(a, cfg, bl, engine)
+        if bl.found:
+            try:
+                engine.apply(cfg)
+            except PermissionError:
+                win._perm_hint()
+        win.win.present()
+
+    app.connect("activate", on_activate)
+    app.run([])
+
+
+def main():
+    if "--version" in sys.argv:
+        print("uniglow", VERSION)
+        return
+    if "--apply" in sys.argv:
+        run_apply()
+        return
+    run_gui()
+
+
+if __name__ == "__main__":
+    main()

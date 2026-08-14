@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=UniGlow
+Name[ru]=UniGlow
+GenericName=Keyboard Backlight
+GenericName[ru]=Подсветка клавиатуры
+Comment=Keyboard backlight control for Uniwill laptops
+Comment[ru]=Управление подсветкой клавиатуры ноутбуков Uniwill
+Exec=uniglow
+Icon=io.github.cloudwells.uniglow
+Terminal=false
+Categories=Settings;HardwareSettings;Utility;
+Keywords=keyboard;backlight;rgb;led;uniwill;mechrevo;tuxedo;
+Keywords[ru]=клавиатура;подсветка;цвет;

@@ -1,0 +1,4 @@
+# UniGlow: let members of group "users" control the keyboard backlight LED
+# (brightness + RGB color) without root.
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="rgb:kbd_backlight|white:kbd_backlight", \
+  RUN+="/bin/sh -c 'chgrp users /sys%p/brightness /sys%p/multi_intensity 2>/dev/null; chmod g+w /sys%p/brightness /sys%p/multi_intensity 2>/dev/null; exit 0'"
