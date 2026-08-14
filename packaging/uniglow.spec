@@ -1,5 +1,5 @@
 Name:           uniglow
-Version:        1.0.0
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        Keyboard backlight control for Uniwill laptops (GTK4)
 Summary(ru):    Управление подсветкой клавиатуры ноутбуков Uniwill (GTK4)
@@ -54,6 +54,14 @@ udevadm trigger --subsystem-match=leds --action=add 2>/dev/null || :
 %{_udevrulesdir}/70-uniglow-kbd-backlight.rules
 
 %changelog
+* Fri Aug 14 2026 CloudWells <151101453+CloudWells@users.noreply.github.com> - 1.1.0-1
+- Move all EC writes to a coalescing worker thread: the Uniwill EC takes
+  ~450 ms per LED write and v1.0.0 wrote from the GTK main loop, freezing
+  the UI. Handlers are now instant; only the newest state is written.
+- Live keyboard preview canvas with glow (instant feedback, animates effects)
+- Brightness as segmented buttons instead of a slider; preset selection ring;
+  speed row hidden for static mode; debounced config saves
+
 * Fri Aug 14 2026 CloudWells <151101453+CloudWells@users.noreply.github.com> - 1.0.0-1
 - Initial release: on/off, brightness, RGB color with presets, breathing and
   rainbow software effects, EN/RU UI, login state restore, udev rule

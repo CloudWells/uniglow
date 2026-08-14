@@ -50,7 +50,7 @@ Make sure your user is a member of group `users` (`id -nG`); if not:
 ### Build the RPM yourself
 
 ```bash
-git archive --format=tar.gz --prefix=uniglow-1.0.0/ -o ~/rpmbuild/SOURCES/uniglow-1.0.0.tar.gz HEAD
+git archive --format=tar.gz --prefix=uniglow-1.1.0/ -o ~/rpmbuild/SOURCES/uniglow-1.1.0.tar.gz HEAD
 rpmbuild -bb packaging/uniglow.spec
 ```
 
