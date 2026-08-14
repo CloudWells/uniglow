@@ -3,61 +3,69 @@
 Keyboard backlight control for Uniwill-based laptops (MECHREVO, TUXEDO, XMG,
 Schenker and other Tongfang/Uniwill ODM machines) running the
 [tuxedo-drivers](https://gitlab.com/tuxedocomputers/development/packages/tuxedo-drivers)
-kernel modules. Native GTK4/libadwaita app, English/Russian UI.
+kernel modules. Native GTK4/libadwaita application with English and Russian UI.
 
-**Features**
+## Features
 
-- On/off, brightness (hardware levels), single-zone RGB color with presets
-- Software effects: breathing, rainbow (the EC has no hardware effects on Linux)
-- Restore state on login (optional autostart), `uniglow --apply` CLI
-- No daemon, no root: ships a udev rule granting group `users` write access
-  to the LED; brightness additionally falls back to systemd-logind
+- Power on/off and brightness (hardware levels)
+- Single-zone RGB color: preset palette + custom color picker
+- Software effects: breathing and rainbow with adjustable speed
+  (the EC exposes no hardware effects on Linux)
+- Restore saved state on login (optional autostart entry)
+- Headless CLI mode: `uniglow --apply`
+- No daemon, no root: a bundled udev rule grants group `users` write access
+  to the LED sysfs attributes; brightness additionally falls back to
+  systemd-logind `SetBrightness`, which needs no extra permissions
 
-**Requirements**
+## Requirements
 
-- Kernel modules `uniwill_wmi` + `tuxedo_keyboard` loaded
-  (device `/sys/class/leds/rgb:kbd_backlight` or `white:kbd_backlight`)
+- Kernel modules `uniwill_wmi` + `tuxedo_keyboard` (tuxedo-drivers) providing
+  `/sys/class/leds/rgb:kbd_backlight` or `/sys/class/leds/white:kbd_backlight`.
+  On non-TUXEDO hardware (e.g. MECHREVO) tuxedo-drivers must be built with its
+  DMI compatibility check disabled.
 - GTK 4.10+, libadwaita 1.7+, python3-gobject
 
-**Install (Fedora/Nobara)**
+## Install
+
+### Fedora / Nobara (RPM)
+
+Grab the RPM from [Releases](https://github.com/CloudWells/uniglow/releases):
 
 ```bash
-sudo dnf install uniglow-*.rpm       # from Releases
+sudo dnf install ./uniglow-*.noarch.rpm
 ```
 
-or manually:
+### Manual
 
 ```bash
 sudo install -m755 uniglow /usr/local/bin/
 sudo install -m644 data/70-uniglow-kbd-backlight.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=leds --action=add
+sudo udevadm control --reload
+sudo udevadm trigger --subsystem-match=leds --action=add
 ```
 
-Make sure your user is in group `users` (`id -nG`), otherwise
+Make sure your user is a member of group `users` (`id -nG`); if not:
 `sudo usermod -aG users $USER` and re-login.
 
----
+### Build the RPM yourself
 
-# UniGlow (по-русски)
+```bash
+git archive --format=tar.gz --prefix=uniglow-1.0.0/ -o ~/rpmbuild/SOURCES/uniglow-1.0.0.tar.gz HEAD
+rpmbuild -bb packaging/uniglow.spec
+```
 
-Управление подсветкой клавиатуры для ноутбуков на шасси Uniwill (MECHREVO,
-TUXEDO, XMG, Schenker и другие), работающих на модулях ядра tuxedo-drivers.
-Нативное приложение GTK4/libadwaita, интерфейс на английском и русском.
+## Usage
 
-**Возможности**
+Launch **UniGlow** from the app grid, or:
 
-- Вкл/выкл, яркость (аппаратные уровни), цвет RGB одной зоной, пресеты
-- Программные эффекты: дыхание, радуга (аппаратных режимов у EC в Linux нет)
-- Восстановление состояния при входе (автостарт), CLI-режим `uniglow --apply`
-- Без демона и без root: в комплекте udev-правило, дающее группе `users`
-  запись в LED; яркость дополнительно умеет ходить через systemd-logind
+```bash
+uniglow            # GUI
+uniglow --apply    # apply saved state (used by the autostart entry;
+                   # stays resident only while an animated mode is active)
+```
 
-**Требования**: загруженные модули `uniwill_wmi` + `tuxedo_keyboard`
-(устройство `/sys/class/leds/rgb:kbd_backlight` или `white:kbd_backlight`),
-GTK 4.10+, libadwaita 1.7+, python3-gobject.
-
-Установка — RPM из Releases либо вручную (см. команды выше). Пользователь
-должен состоять в группе `users`.
+The UI language follows the system locale; switch it manually from the
+hamburger menu (System / English / Русский).
 
 ## License
 
