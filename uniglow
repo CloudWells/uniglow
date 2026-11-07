@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-# UniGlow — keyboard backlight control for Uniwill laptops (tuxedo-drivers).
-# Talks to /sys/class/leds/{rgb,white}:kbd_backlight; brightness falls back to
-# systemd-logind SetBrightness when sysfs is not writable.
+# UniGlow — keyboard backlight and laptop control for Uniwill laptops.
+# Backlight: /sys/class/leds/{uniwill:rgb,rgb,white}:kbd_backlight (upstream
+# uniwill-laptop driver or tuxedo-drivers); brightness falls back to
+# systemd-logind SetBrightness when sysfs is not writable. Sensors, charging
+# mode, Fn lock and Super key lock come from the uniwill-laptop driver.
 #
 # The EC is extremely slow: one sysfs LED write blocks for ~450 ms on Uniwill
 # hardware. All device writes therefore happen on a worker thread that
@@ -11,6 +13,7 @@
 # MIT License. https://github.com/CloudWells/uniglow
 
 import colorsys
+import glob
 import json
 import locale
 import math
@@ -22,7 +25,7 @@ import threading
 import time
 
 APP_ID = "io.github.cloudwells.uniglow"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "uniglow")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -30,7 +33,15 @@ AUTOSTART_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "autostart")
 AUTOSTART_PATH = os.path.join(AUTOSTART_DIR, "uniglow-apply.desktop")
 
-LED_CANDIDATES = ("rgb:kbd_backlight", "white:kbd_backlight")
+# upstream uniwill-laptop first; tuxedo-drivers names kept as a fallback
+LED_CANDIDATES = ("uniwill:rgb:kbd_backlight", "rgb:kbd_backlight",
+                  "white:kbd_backlight")
+
+# uniwill-laptop driver: platform device, hwmon chip, battery extension
+UNIWILL_DEV = "/sys/bus/platform/devices/INOU0000:00"
+UNIWILL_HWMON = "uniwill"
+CHARGE_MODES = ("Standard", "Long_Life", "Trickle")   # display order
+SENSOR_INTERVAL = 2.0                                  # seconds
 
 PRESETS = [
     "#FFFFFF", "#FF3B30", "#FF9500", "#FFCC00",
@@ -65,9 +76,32 @@ STRINGS = {
         "autostart": "Restore on login",
         "about": "About UniGlow",
         "no_device": "No keyboard backlight device found.\n"
-                     "Install tuxedo-drivers (uniwill_wmi + tuxedo_keyboard) first.",
-        "no_perm": "No write access to the LED — install the bundled udev rule",
-        "comment": "Keyboard backlight control",
+                     "Load the uniwill-laptop kernel driver (or tuxedo-drivers) first.",
+        "no_perm": "No write access — install the bundled udev rule",
+        "write_failed": "Could not apply the setting: %s",
+        "comment": "Keyboard backlight and laptop control",
+        "page_backlight": "Backlight",
+        "page_laptop": "Laptop",
+        "sensors": "Sensors",
+        "s_CPU": "CPU",
+        "s_GPU": "GPU",
+        "s_Main": "Main fan",
+        "s_Secondary": "Secondary fan",
+        "temp_n": "Temperature %d",
+        "fan_n": "Fan %d",
+        "rpm": "RPM",
+        "charging": "Battery charging",
+        "ch_Standard": "Full (100 %)",
+        "ch_Long_Life": "Balanced",
+        "ch_Trickle": "Stationary",
+        "chd_Standard": "Charges to 100 % for maximum runtime",
+        "chd_Long_Life": "Stops short of a full charge to extend battery life",
+        "chd_Trickle": "For a laptop that stays on AC: lowest charge level",
+        "keyboard": "Keyboard",
+        "fn_lock": "Fn Lock",
+        "fn_lock_sub": "Swaps F1–F12 and media key functions",
+        "super_lock": "Lock Super key",
+        "super_lock_sub": "Disables the Super (Windows) key",
     },
     "ru": {
         "app": "UniGlow",
@@ -86,9 +120,32 @@ STRINGS = {
         "autostart": "Восстанавливать при входе",
         "about": "О приложении",
         "no_device": "Устройство подсветки клавиатуры не найдено.\n"
-                     "Сначала установите tuxedo-drivers (uniwill_wmi + tuxedo_keyboard).",
-        "no_perm": "Нет прав на запись в LED — установите udev-правило из комплекта",
-        "comment": "Управление подсветкой клавиатуры",
+                     "Сначала загрузите драйвер ядра uniwill-laptop (или tuxedo-drivers).",
+        "no_perm": "Нет прав на запись — установите udev-правило из комплекта",
+        "write_failed": "Не удалось применить настройку: %s",
+        "comment": "Управление подсветкой клавиатуры и ноутбуком",
+        "page_backlight": "Подсветка",
+        "page_laptop": "Ноутбук",
+        "sensors": "Датчики",
+        "s_CPU": "Процессор",
+        "s_GPU": "Видеокарта",
+        "s_Main": "Основной вентилятор",
+        "s_Secondary": "Второй вентилятор",
+        "temp_n": "Температура %d",
+        "fan_n": "Вентилятор %d",
+        "rpm": "об/мин",
+        "charging": "Заряд батареи",
+        "ch_Standard": "До 100 %",
+        "ch_Long_Life": "Сбалансированно",
+        "ch_Trickle": "Стационарно",
+        "chd_Standard": "Заряжает до 100 % — максимум автономности",
+        "chd_Long_Life": "Не заряжает до конца, чтобы продлить ресурс батареи",
+        "chd_Trickle": "Для работы от сети: самый низкий уровень заряда",
+        "keyboard": "Клавиатура",
+        "fn_lock": "Fn Lock",
+        "fn_lock_sub": "Меняет местами F1–F12 и мультимедийные функции",
+        "super_lock": "Блокировка клавиши Super",
+        "super_lock_sub": "Отключает клавишу Super (Windows)",
     },
 }
 
@@ -127,6 +184,22 @@ def rgb_to_hex(r, g, b):
     return "#%02X%02X%02X" % (r, g, b)
 
 
+def read_sysfs(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def parse_charge_types(text):
+    """'Trickle [Standard] Long_Life' -> (['Trickle', ...], 'Standard')."""
+    modes, current = [], None
+    for tok in text.split():
+        if tok.startswith("[") and tok.endswith("]"):
+            tok = tok[1:-1]
+            current = tok
+        modes.append(tok)
+    return modes, current
+
+
 def effect_rgb(cfg, t):
     """Ideal effect color at time t (shared by device writer and UI preview)."""
     base = hex_to_rgb(cfg["color"])
@@ -159,12 +232,22 @@ class Backlight:
             if os.path.isdir(p):
                 self.path = p
                 self.name = name
-                self.is_rgb = name.startswith("rgb:")
+                self.is_rgb = "rgb:" in name
                 break
         self.max_brightness = 1
+        self.max_intensity = (255, 255, 255)  # tuxedo-drivers: 0..255/channel
         if self.path:
             with open(os.path.join(self.path, "max_brightness")) as f:
                 self.max_brightness = int(f.read().strip())
+            # uniwill-laptop takes 0..50 per channel and silently clamps
+            # larger values, which would wash every color out to white
+            try:
+                mi = [int(v) for v in read_sysfs(
+                    os.path.join(self.path, "multi_max_intensity")).split()]
+                if len(mi) == 3 and all(v > 0 for v in mi):
+                    self.max_intensity = tuple(mi)
+            except (OSError, ValueError):
+                pass
 
     @property
     def found(self):
@@ -187,10 +270,16 @@ class Backlight:
                  "ssu", "leds", self.name, str(value)],
                 check=False, capture_output=True)
 
+    def scale_color(self, rgb):
+        """0..255 RGB -> the LED's own per-channel intensity range."""
+        return tuple(int(round(c * m / 255))
+                     for c, m in zip(rgb, self.max_intensity))
+
     def set_color(self, r, g, b):
         # raises PermissionError for the caller to surface a hint
         if self.is_rgb:
-            self._write("multi_intensity", "%d %d %d" % (r, g, b))
+            self._write("multi_intensity",
+                        "%d %d %d" % self.scale_color((r, g, b)))
 
 
 class Writer(threading.Thread):
@@ -232,9 +321,12 @@ class Writer(threading.Thread):
             self._last_brightness = v
 
     def _set_color(self, rgb):
-        if rgb != self._last_color:
+        # compare in device units: nearby 0..255 colors often map to the same
+        # 0..50 intensities, and every skipped write saves ~450 ms of EC time
+        scaled = self.bl.scale_color(rgb)
+        if scaled != self._last_color:
             self.bl.set_color(*rgb)
-            self._last_color = rgb
+            self._last_color = scaled
 
     def sync_once(self, cfg):
         """Apply non-animated parts of cfg (blocking; used headless too)."""
@@ -269,6 +361,200 @@ class Writer(threading.Thread):
                 time.sleep(1)
             except OSError:
                 time.sleep(1)
+
+
+class Laptop:
+    """uniwill-laptop extras: hwmon sensors, charging mode, Fn/Super lock.
+
+    Every attribute is optional; whatever is missing just hides its UI.
+    """
+
+    def __init__(self):
+        self.temps = []   # (index, label, input path)
+        self.fans = []    # (index, label, input path, pwm path | None)
+        hw = None
+        for d in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+            try:
+                if read_sysfs(os.path.join(d, "name")) == UNIWILL_HWMON:
+                    hw = d
+                    break
+            except OSError:
+                pass
+        if hw:
+            for kind in ("temp", "fan"):
+                idx = sorted(int(f[len(kind):-6]) for f in os.listdir(hw)
+                             if f.startswith(kind) and f.endswith("_input")
+                             and f[len(kind):-6].isdigit())
+                for i in idx:
+                    try:
+                        label = read_sysfs(
+                            os.path.join(hw, "%s%d_label" % (kind, i)))
+                    except OSError:
+                        label = None
+                    inp = os.path.join(hw, "%s%d_input" % (kind, i))
+                    if kind == "temp":
+                        self.temps.append((i, label, inp))
+                    else:
+                        pwm = os.path.join(hw, "pwm%d" % i)
+                        self.fans.append((i, label, inp,
+                                          pwm if os.path.exists(pwm) else None))
+        self.fn_lock = self._attr(UNIWILL_DEV, "fn_lock")
+        self.super_key = self._attr(UNIWILL_DEV, "super_key_enable")
+        # charging modes come from the driver's battery extension
+        self.charge = None
+        for bat in sorted(glob.glob("/sys/class/power_supply/BAT*")):
+            if os.path.isdir(os.path.join(bat, "extensions", "uniwill")) or \
+                    os.path.isdir(UNIWILL_DEV):
+                self.charge = self._attr(bat, "charge_types")
+                if self.charge:
+                    break
+
+    @staticmethod
+    def _attr(base, name):
+        p = os.path.join(base, name)
+        return p if os.path.exists(p) else None
+
+    @property
+    def has_sensors(self):
+        return bool(self.temps or self.fans)
+
+    @property
+    def found(self):
+        return bool(self.has_sensors or self.charge or self.fn_lock
+                    or self.super_key)
+
+    def read_charge(self):
+        modes, cur = parse_charge_types(read_sysfs(self.charge))
+        return [m for m in CHARGE_MODES if m in modes], cur
+
+    def snapshot(self):
+        """Blocking read of everything (EC-backed, ~100 ms): worker only."""
+        d = {"temps": {}, "fans": {}, "controls": {}}
+        for i, _label, p in self.temps:
+            try:
+                d["temps"][i] = int(read_sysfs(p)) / 1000
+            except (OSError, ValueError):
+                d["temps"][i] = None
+        for i, _label, p, pwm in self.fans:
+            rpm = duty = None
+            try:
+                rpm = int(read_sysfs(p))
+                if pwm:
+                    duty = round(int(read_sysfs(pwm)) * 100 / 255)
+            except (OSError, ValueError):
+                pass
+            d["fans"][i] = (rpm, duty)
+        for p in (self.fn_lock, self.super_key, self.charge):
+            if p:
+                try:
+                    d["controls"][p] = read_sysfs(p)
+                except OSError:
+                    pass
+        return d
+
+
+class AttrWriter(threading.Thread):
+    """Serial writer for single-value sysfs settings (EC-backed, may block).
+
+    Coalesces per path to the newest value and reports every result through
+    on_done(path, value, error) on the worker thread. A per-path generation
+    counter lets readers drop values read while a write was in flight; a
+    path also stays "busy" for SETTLE seconds after its write, because the
+    EC applies some settings (Super key lock) asynchronously and reads back
+    the old value for up to a second.
+    """
+
+    SETTLE = 2.5
+
+    def __init__(self, on_done=None):
+        super().__init__(daemon=True)
+        self.on_done = on_done
+        self.cond = threading.Condition()
+        self.pending = {}   # path -> value
+        self.inflight = None
+        self.gen = {}       # path -> counter
+        self.done_at = {}   # path -> monotonic time of the last write
+
+    def write(self, path, value):
+        with self.cond:
+            self.pending[path] = value
+            self.gen[path] = self.gen.get(path, 0) + 1
+            self.cond.notify()
+
+    def state(self):
+        """(generation per path, paths queued or being written)."""
+        with self.cond:
+            busy = set(self.pending)
+            if self.inflight:
+                busy.add(self.inflight)
+            now = time.monotonic()
+            busy.update(p for p, t in self.done_at.items()
+                        if now - t < self.SETTLE)
+            return dict(self.gen), busy
+
+    def run(self):
+        while True:
+            with self.cond:
+                while not self.pending:
+                    self.cond.wait()
+                path = next(iter(self.pending))
+                value = self.pending.pop(path)
+                self.inflight = path
+            err = None
+            try:
+                with open(path, "w") as f:
+                    f.write(value)
+            except OSError as e:
+                err = e
+            with self.cond:
+                self.gen[path] = self.gen.get(path, 0) + 1
+                self.done_at[path] = time.monotonic()
+                self.inflight = None
+            if self.on_done:
+                self.on_done(path, value, err)
+
+
+class Poller(threading.Thread):
+    """Reads sensors and settings every SENSOR_INTERVAL while active.
+
+    The window activates it only while it is visible, so a hidden or
+    minimized UniGlow costs no EC reads at all.
+    """
+
+    def __init__(self, laptop, attrw, on_data):
+        super().__init__(daemon=True)
+        self.lp = laptop
+        self.attrw = attrw
+        self.on_data = on_data
+        self.cond = threading.Condition()
+        self.active = False
+        self.kicked = False
+
+    def set_active(self, on):
+        with self.cond:
+            if on != self.active:
+                self.active = on
+                self.cond.notify()
+
+    def kick(self):
+        """Read again right away (e.g. after a failed write)."""
+        with self.cond:
+            self.kicked = True
+            self.cond.notify()
+
+    def run(self):
+        while True:
+            with self.cond:
+                while not self.active:
+                    self.cond.wait()
+                self.kicked = False
+            gens = self.attrw.state()[0]
+            data = self.lp.snapshot()
+            data["gens"] = gens
+            self.on_data(data)
+            with self.cond:
+                if not self.kicked:
+                    self.cond.wait(SENSOR_INTERVAL)
 
 
 def autostart_enabled():
@@ -348,7 +634,8 @@ CSS = """
 
 
 class Window:
-    def __init__(self, app, cfg, bl, writer):
+    def __init__(self, app, cfg, bl, writer, laptop=None, attrw=None,
+                 poller=None):
         import gi
         gi.require_version("Gtk", "4.0")
         gi.require_version("Adw", "1")
@@ -359,6 +646,13 @@ class Window:
         self.cfg = cfg
         self.bl = bl
         self.writer = writer
+        self.laptop = laptop
+        self.attrw = attrw
+        self.poller = poller
+        self._last_data = None
+        self.sensor_labels = {}
+        self.charge_toggles = None
+        self.sw_fn = self.sw_super = None
         self.t = STRINGS[pick_lang(cfg)]
         self._building = True
         self._save_timer = None
@@ -385,21 +679,46 @@ class Window:
         self.toast = Adw.ToastOverlay()
         self.toolbar.set_content(self.toast)
 
-        clamp = Adw.Clamp(maximum_size=420, margin_top=10, margin_bottom=18,
-                          margin_start=14, margin_end=14)
-        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        clamp.set_child(self.box)
-        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-        scroll.set_child(clamp)
-        self.toast.set_child(scroll)
+        # pages: backlight always, laptop only when uniwill-laptop exposes it
+        self.stack = Adw.ViewStack()
+        self.toast.set_child(self.stack)
+        self.box, self.page_bl = self._add_page(
+            "backlight", self.t["page_backlight"], "keyboard-brightness-symbolic")
+        self.sys_box = self.page_lp = None
+        if laptop and laptop.found:
+            self.sys_box, self.page_lp = self._add_page(
+                "laptop", self.t["page_laptop"], "computer-symbolic")
+            header.set_title_widget(Adw.ViewSwitcher(
+                stack=self.stack, policy=Adw.ViewSwitcherPolicy.WIDE))
+            # sensors are polled only while this page is on screen
+            self.win.connect("map", self._update_polling)
+            self.win.connect("unmap", self._update_polling)
+            self.win.connect("realize", self._on_realize)
+            self.stack.connect("notify::visible-child-name",
+                               self._update_polling)
 
         self._build_menu()
         if not bl.found:
             self._build_missing()
         else:
             self._build_controls()
+        if self.sys_box:
+            self._build_laptop()
+            if not bl.found:
+                self.stack.set_visible_child_name("laptop")
         self._building = False
         self._sync_ui()
+
+    def _add_page(self, name, title, icon):
+        Adw, Gtk = self.Adw, self.Gtk
+        clamp = Adw.Clamp(maximum_size=420, margin_top=10, margin_bottom=18,
+                          margin_start=14, margin_end=14)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        clamp.set_child(box)
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.set_child(clamp)
+        page = self.stack.add_titled_with_icon(scroll, name, title, icon)
+        return box, page
 
     # ---------- UI construction ----------
 
@@ -490,6 +809,79 @@ class Window:
             g3.add(self.row_speed)
             self.box.append(g3)
             self.grp_mode = g3
+
+    def _sensor_title(self, label, fallback_key, i):
+        key = "s_%s" % label
+        return self.t[key] if key in self.t else (label or self.t[fallback_key] % i)
+
+    def _build_laptop(self):
+        Adw, Gtk = self.Adw, self.Gtk
+        t, lp = self.t, self.laptop
+
+        # sensors: read-only, filled by the poller
+        self.sensor_labels = {}
+        if lp.has_sensors:
+            g = Adw.PreferencesGroup(title=t["sensors"])
+            for kind, items in (("t", lp.temps), ("f", lp.fans)):
+                for item in items:
+                    i, label = item[0], item[1]
+                    row = Adw.ActionRow(title=self._sensor_title(
+                        label, "temp_n" if kind == "t" else "fan_n", i))
+                    val = Gtk.Label(label="—", valign=Gtk.Align.CENTER)
+                    val.add_css_class("numeric")
+                    row.add_suffix(val)
+                    g.add(row)
+                    self.sensor_labels[(kind, i)] = val
+            self.sys_box.append(g)
+
+        # charging mode
+        self.charge_toggles = None
+        self._charge_modes = []
+        if lp.charge:
+            try:
+                self._charge_modes, cur = lp.read_charge()
+            except OSError:
+                cur = None
+            if self._charge_modes:
+                g = Adw.PreferencesGroup(title=t["charging"])
+                self.charge_toggles = Adw.ToggleGroup(margin_top=4,
+                                                      margin_bottom=4)
+                for m in self._charge_modes:
+                    self.charge_toggles.add(Adw.Toggle(name=m,
+                                                       label=t["ch_" + m]))
+                g.add(self.charge_toggles)
+                self.grp_charge = g
+                self._show_charge(cur)
+                self.charge_toggles.connect("notify::active-name",
+                                            self._charge_changed)
+                self.sys_box.append(g)
+
+        # keyboard locks
+        self.sw_fn = self.sw_super = None
+        rows = []
+        if lp.fn_lock:
+            self.sw_fn = Adw.SwitchRow(title=t["fn_lock"],
+                                       subtitle=t["fn_lock_sub"])
+            self.sw_fn.connect("notify::active", self._fn_changed)
+            rows.append(self.sw_fn)
+        if lp.super_key:
+            self.sw_super = Adw.SwitchRow(title=t["super_lock"],
+                                          subtitle=t["super_lock_sub"])
+            self.sw_super.connect("notify::active", self._super_changed)
+            rows.append(self.sw_super)
+        if rows:
+            g = Adw.PreferencesGroup(title=t["keyboard"])
+            for r in rows:
+                g.add(r)
+            self.sys_box.append(g)
+        for p in (lp.fn_lock, lp.super_key):
+            if p:
+                try:
+                    self._apply_control(p, read_sysfs(p))
+                except OSError:
+                    pass
+        if self._last_data:
+            self._on_data(self._last_data, controls=False)
 
     def _build_menu(self):
         Gio = self.Gio
@@ -643,6 +1035,103 @@ class Window:
         self.hero.queue_draw()
         return True
 
+    # ---------- laptop page ----------
+
+    def _show_charge(self, mode):
+        if self.charge_toggles and mode in self._charge_modes:
+            self.charge_toggles.set_active_name(mode)
+            self.grp_charge.set_description(self.t["chd_" + mode])
+
+    def _apply_control(self, path, value):
+        """Reflect a value read from sysfs without triggering a write."""
+        lp = self.laptop
+        prev, self._building = self._building, True
+        try:
+            if path == lp.charge:
+                self._show_charge(parse_charge_types(value)[1])
+            elif path == lp.fn_lock and self.sw_fn:
+                self.sw_fn.set_active(value == "1")
+            elif path == lp.super_key and self.sw_super:
+                self.sw_super.set_active(value == "0")
+        finally:
+            self._building = prev
+
+    def _charge_changed(self, *args):
+        if self._building:
+            return
+        mode = self.charge_toggles.get_active_name()
+        if mode:
+            self.grp_charge.set_description(self.t["chd_" + mode])
+            self.attrw.write(self.laptop.charge, mode)
+
+    def _fn_changed(self, row, _pspec):
+        if not self._building:
+            self.attrw.write(self.laptop.fn_lock,
+                             "1" if row.get_active() else "0")
+
+    def _super_changed(self, row, _pspec):
+        # the switch *locks* the key, the driver attribute *enables* it
+        if not self._building:
+            self.attrw.write(self.laptop.super_key,
+                             "0" if row.get_active() else "1")
+
+    def _on_attr_done(self, path, value, err):
+        if err is not None:
+            if isinstance(err, PermissionError):
+                self._perm_hint()
+            else:
+                self.toast.add_toast(self.Adw.Toast(
+                    title=self.t["write_failed"] % (err.strerror or err),
+                    timeout=6))
+            try:  # put the widget back to what the device really has
+                self._apply_control(path, read_sysfs(path))
+            except OSError:
+                pass
+        return False
+
+    def _on_data(self, data, controls=True):
+        self._last_data = data
+        for i, v in data["temps"].items():
+            lbl = self.sensor_labels.get(("t", i))
+            if lbl:
+                lbl.set_label("—" if v is None else "%d °C" % round(v))
+        for i, (rpm, duty) in data["fans"].items():
+            lbl = self.sensor_labels.get(("f", i))
+            if lbl is None:
+                continue
+            if rpm is None:
+                lbl.set_label("—")
+                continue
+            text = "%d %s" % (rpm, self.t["rpm"])
+            if duty is not None:
+                text = '<span alpha="55%%">%d %%</span>    %s' % (duty, text)
+            lbl.set_markup(text)
+        if controls and self.attrw:
+            gens, busy = self.attrw.state()
+            for p, v in data["controls"].items():
+                # drop values read while a write to the same attribute ran
+                if p not in busy and gens.get(p, 0) == data["gens"].get(p, 0):
+                    self._apply_control(p, v)
+        return False
+
+    def _on_realize(self, win):
+        surface = win.get_surface()
+        if surface is not None:
+            surface.connect("notify::state", self._update_polling)
+
+    def _update_polling(self, *args):
+        if not self.poller:
+            return
+        Gdk = self.Gdk
+        visible = self.win.get_mapped()
+        surface = self.win.get_surface()
+        if visible and isinstance(surface, Gdk.Toplevel):
+            hidden = Gdk.ToplevelState.MINIMIZED | getattr(
+                Gdk.ToplevelState, "SUSPENDED", 0)
+            visible = not (surface.get_state() & hidden)
+        self.poller.set_active(
+            bool(visible) and self.stack.get_visible_child_name() == "laptop")
+
     def _perm_hint(self):
         toast = self.Adw.Toast(title=self.t["no_perm"], timeout=6)
         self.toast.add_toast(toast)
@@ -652,14 +1141,19 @@ class Window:
         self.cfg["lang"] = value.get_string()
         save_config(self.cfg)
         self.t = STRINGS[pick_lang(self.cfg)]
-        while child := self.box.get_first_child():
-            self.box.remove(child)
+        for box in (self.box, self.sys_box):
+            while box is not None and (child := box.get_first_child()):
+                box.remove(child)
         self._building = True
         self._build_menu()
         if self.bl.found:
             self._build_controls()
         else:
             self._build_missing()
+        self.page_bl.set_title(self.t["page_backlight"])
+        if self.sys_box:
+            self.page_lp.set_title(self.t["page_laptop"])
+            self._build_laptop()
         self._building = False
         self._sync_ui()
         self.win.set_title(self.t["app"])
@@ -681,6 +1175,8 @@ class Window:
         about.present(self.win)
 
     def _on_close(self, *args):
+        if self.poller:
+            self.poller.set_active(False)
         # keep an animated mode running after the window closes
         if self._save_timer:
             self.GLib.source_remove(self._save_timer)
@@ -699,14 +1195,29 @@ def run_gui():
     kill_stray_apply()
     cfg = load_config()
     bl = Backlight()
+    laptop = Laptop()
     state = {}
 
     def perm_error():
         GLib.idle_add(lambda: state["w"]._perm_hint() if "w" in state else False)
 
+    def attr_done(path, value, err):
+        GLib.idle_add(lambda: state["w"]._on_attr_done(path, value, err)
+                      if "w" in state else False)
+
+    def sensor_data(data):
+        GLib.idle_add(lambda: state["w"]._on_data(data)
+                      if "w" in state else False)
+
     writer = Writer(bl, on_perm_error=perm_error)
     if bl.found:
         writer.start()
+    attrw = poller = None
+    if laptop.found:
+        attrw = AttrWriter(on_done=attr_done)
+        poller = Poller(laptop, attrw, sensor_data)
+        attrw.start()
+        poller.start()
 
     app = Adw.Application(application_id=APP_ID)
 
@@ -714,7 +1225,7 @@ def run_gui():
         for w in a.get_windows():
             w.present()
             return
-        win = Window(a, cfg, bl, writer)
+        win = Window(a, cfg, bl, writer, laptop, attrw, poller)
         state["w"] = win
         if bl.found:
             writer.update(cfg)

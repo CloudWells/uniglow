@@ -1,4 +1,16 @@
 # UniGlow: let members of group "users" control the keyboard backlight LED
-# (brightness + RGB color) without root.
-ACTION=="add", SUBSYSTEM=="leds", KERNEL=="rgb:kbd_backlight|white:kbd_backlight", \
+# (brightness + RGB color) and the laptop settings without root.
+
+# Keyboard LED: upstream uniwill-laptop name first, tuxedo-drivers names kept
+ACTION=="add|change", SUBSYSTEM=="leds", KERNEL=="uniwill:rgb:kbd_backlight|rgb:kbd_backlight|white:kbd_backlight", \
   RUN+="/bin/sh -c 'chgrp users /sys%p/brightness /sys%p/multi_intensity 2>/dev/null; chmod g+w /sys%p/brightness /sys%p/multi_intensity 2>/dev/null; exit 0'"
+
+# uniwill-laptop: Fn lock and Super key lock (attributes appear on driver bind)
+ACTION=="add|bind|change", SUBSYSTEM=="platform", KERNEL=="INOU0000:00", \
+  RUN+="/bin/sh -c 'chgrp users /sys%p/fn_lock /sys%p/super_key_enable 2>/dev/null; chmod g+w /sys%p/fn_lock /sys%p/super_key_enable 2>/dev/null; exit 0'"
+
+# uniwill-laptop battery extension: charging mode (written to charge_types;
+# charge_type is covered too for kernels that expose it). Matched on "change"
+# as well, so battery events and `udevadm trigger` re-apply it.
+ACTION=="add|change", SUBSYSTEM=="power_supply", KERNEL=="BAT0", \
+  RUN+="/bin/sh -c 'chgrp users /sys%p/charge_types /sys%p/charge_type 2>/dev/null; chmod g+w /sys%p/charge_types /sys%p/charge_type 2>/dev/null; exit 0'"

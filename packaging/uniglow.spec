@@ -1,8 +1,8 @@
 Name:           uniglow
-Version:        1.1.0
+Version:        1.2.0
 Release:        1%{?dist}
-Summary:        Keyboard backlight control for Uniwill laptops (GTK4)
-Summary(ru):    Управление подсветкой клавиатуры ноутбуков Uniwill (GTK4)
+Summary:        Keyboard backlight and laptop control for Uniwill laptops (GTK4)
+Summary(ru):    Подсветка клавиатуры и управление ноутбуками Uniwill (GTK4)
 License:        MIT
 URL:            https://github.com/CloudWells/uniglow
 Source0:        %{name}-%{version}.tar.gz
@@ -17,17 +17,21 @@ Requires:       systemd-udev
 %description
 Native GTK4/libadwaita application to control the keyboard backlight of
 Uniwill-based laptops (MECHREVO, TUXEDO, XMG, Schenker...) driven by the
-tuxedo-drivers kernel modules: on/off, brightness, single-zone RGB color,
-software breathing/rainbow effects, state restore on login. English and
-Russian UI. Ships a udev rule granting group "users" write access to the
-LED sysfs attributes.
+upstream uniwill-laptop kernel driver or tuxedo-drivers: on/off, brightness,
+single-zone RGB color, software breathing/rainbow effects, state restore on
+login. With uniwill-laptop it also shows CPU/GPU temperatures and fan speeds
+and switches the battery charging mode, Fn lock and Super key lock. English
+and Russian UI. Ships a udev rule granting group "users" write access to the
+LED and laptop sysfs attributes.
 
 %description -l ru
 Нативное GTK4/libadwaita-приложение для управления подсветкой клавиатуры
 ноутбуков на шасси Uniwill (MECHREVO, TUXEDO, XMG, Schenker...) с модулями
-ядра tuxedo-drivers: вкл/выкл, яркость, цвет RGB, программные эффекты
-«дыхание» и «радуга», восстановление состояния при входе. Интерфейс на
-английском и русском.
+ядра uniwill-laptop или tuxedo-drivers: вкл/выкл, яркость, цвет RGB,
+программные эффекты «дыхание» и «радуга», восстановление состояния при входе.
+С драйвером uniwill-laptop также показывает температуры CPU/GPU и обороты
+вентиляторов, переключает режим заряда батареи, Fn Lock и блокировку клавиши
+Super. Интерфейс на английском и русском.
 
 %prep
 %autosetup
@@ -43,7 +47,11 @@ install -Dpm 0644 data/70-uniglow-kbd-backlight.rules \
 
 %post
 udevadm control --reload 2>/dev/null || :
-udevadm trigger --subsystem-match=leds --action=add 2>/dev/null || :
+udevadm trigger --subsystem-match=leds --action=change 2>/dev/null || :
+udevadm trigger --subsystem-match=platform --sysname-match='INOU0000:00' \
+    --action=change 2>/dev/null || :
+udevadm trigger --subsystem-match=power_supply --sysname-match=BAT0 \
+    --action=change 2>/dev/null || :
 
 %files
 %license LICENSE
@@ -54,6 +62,16 @@ udevadm trigger --subsystem-match=leds --action=add 2>/dev/null || :
 %{_udevrulesdir}/70-uniglow-kbd-backlight.rules
 
 %changelog
+* Sat Nov 07 2026 CloudWells <151101453+CloudWells@users.noreply.github.com> - 1.2.0-1
+- Support the upstream uniwill-laptop driver: LED uniwill:rgb:kbd_backlight
+  first (tuxedo-drivers names kept), colors scaled to multi_max_intensity
+  (0..50 per channel; the kernel clamps larger values and colors washed out)
+- Laptop page: CPU/GPU temperatures, fan RPM and PWM duty (polled every 2 s
+  only while visible), battery charging mode via charge_types, Fn lock,
+  Super key lock; writes on a worker thread
+- udev rule: new LED name, fn_lock/super_key_enable on INOU0000:00,
+  charge_types/charge_type on BAT0; %post triggers all three
+
 * Fri Aug 14 2026 CloudWells <151101453+CloudWells@users.noreply.github.com> - 1.1.0-1
 - Move all EC writes to a coalescing worker thread: the Uniwill EC takes
   ~450 ms per LED write and v1.0.0 wrote from the GTK main loop, freezing
